@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "pycul"
-version = "0.1.0"
+version = "0.1.1"
 description = "Asyncio library for busware CUL / culfw sticks (eQ-3 MAX! and more)"
 readme = "README.md"
 license = "GPL-2.0-or-later"
