@@ -107,6 +107,10 @@ frame's Ack; `enqueue()` returns the queue entry without waiting. The queue:
 - holds frames for window contacts until the contact transmits, because it
   only listens right after sending;
 - recomputes time information right before sending;
+- answers a pairing request once and before everything else, as the device
+  only listens right after it asked;
+- skips the remaining frames of a zone setup to a device that did not answer
+  its first one;
 - waits for a stick to (re)connect; `expires=` limits how long a frame may wait.
 
 `queue.pending`, `queue.waiting_for_credit` and `queue.add_listener()` let an

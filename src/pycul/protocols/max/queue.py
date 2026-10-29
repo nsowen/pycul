@@ -75,6 +75,8 @@ class OutgoingMessage:
     #: Called before every attempt to recompute the payload (e.g. current time).
     refresh: Callable[[], bytes] | None = None
     expires_at: float | None = None
+    #: Skip this frame if that one failed (e.g. a device that did not answer).
+    requires: OutgoingMessage | None = None
     future: asyncio.Future[bytes | None] = field(
         default_factory=lambda: asyncio.get_running_loop().create_future()
     )
@@ -91,6 +93,11 @@ class OutgoingMessage:
 
     def __str__(self) -> str:
         return f"{self.msg_type.name} -> {self.dst} ({self.payload.hex() or '-'})"
+
+
+def _failed(message: OutgoingMessage) -> bool:
+    future = message.future
+    return future.done() and (future.cancelled() or future.exception() is not None)
 
 
 type Transmit = Callable[[OutgoingMessage, "Cul", bool], Awaitable[bytes | None]]
@@ -127,12 +134,15 @@ class SendQueue:
         self._listeners.append(listener)
         return lambda: self._listeners.remove(listener)
 
-    def submit(self, message: OutgoingMessage, *, before_dst: bool = False) -> OutgoingMessage:
+    def submit(
+        self, message: OutgoingMessage, *, before_dst: bool = False, first: bool = False
+    ) -> OutgoingMessage:
         """Queue a frame and return the queued entry; await its `future` for the Ack.
 
         If an unsent frame with the same key is queued, it takes over the new
         payload and keeps its position; the returned entry is then that frame.
         before_dst: insert in front of the first queued frame to the same device.
+        first: insert in front of every unsent frame (time-critical answers).
         """
         if message.key is not None:
             for queued in self._queue:
@@ -148,7 +158,9 @@ class SendQueue:
                     self._notify()
                     return queued
         index = len(self._queue)
-        if before_dst:
+        if first:
+            index = sum(1 for queued in self._queue if queued.in_flight)
+        elif before_dst:
             index = next(
                 (
                     i
@@ -179,6 +191,16 @@ class SendQueue:
             for queued in self._queue
             if queued.dst == address and (msg_type is None or queued.msg_type is msg_type)
         )
+
+    def cancel(self, message: OutgoingMessage) -> bool:
+        """Drop one unsent frame; its future fails with SendCancelledError."""
+        if message.in_flight or message not in self._queue:
+            return False
+        self._queue.remove(message)
+        if not message.future.done():
+            message.future.set_exception(SendCancelledError(f"{message} was cancelled"))
+        self._notify()
+        return True
 
     def clear(self, address: str | None = None) -> int:
         """Drop unsent frames (to `address`, or all). Returns how many were dropped."""
@@ -271,6 +293,13 @@ class SendQueue:
             message = self._next()
             if message is None:
                 await self._wait(next_expiry)
+                continue
+
+            if (required := message.requires) is not None and _failed(required):
+                self._finish(
+                    message,
+                    error=SendCancelledError(f"{message} skipped: {required} failed"),
+                )
                 continue
 
             cul = self._select_cul(message)

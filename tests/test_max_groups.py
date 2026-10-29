@@ -9,7 +9,7 @@ from datetime import datetime
 
 import pytest
 
-from pycul import Cul
+from pycul import Cul, NoAckError
 from pycul.protocols.max import (
     ButtonState,
     DeviceType,
@@ -299,3 +299,72 @@ async def test_probe_is_repeated_later_after_no_answer(
     ack_responder(stick, state="192b00")
     await heard()  # later: asked again, answers, adopted
     assert WT in proto.devices
+
+
+# ------------------------------------------------- fixes from the first field test
+
+
+async def test_repeated_pair_pings_get_one_pong_first_in_line(
+    proto: MaxProtocol, stick: FakeStick
+) -> None:
+    stick.credits = 0  # nothing can be sent: everything stays queued
+    proto.enqueue(HT, MessageType.TIME_INFORMATION, b"\x00", key="other")
+    waiting = proto.enqueue(HT, MessageType.WAKE_UP, b"\x3f", key="waiting")
+    ping = "1101a14e455130383934333932"  # thermostat, serial NEQ0894392
+    for counter in range(3):  # the device repeats its ping every few seconds
+        stick.emit(frame(MessageType.PAIR_PING, HT2, ME, ping, counter=counter))
+    await settle()
+    pending = proto.queue.pending
+    pongs = [m for m in pending if m.msg_type is MessageType.PAIR_PONG]
+    assert len(pongs) == 1
+    # Only a frame already on its way can stay in front of the answer.
+    assert pending.index(pongs[0]) < pending.index(waiting)
+    proto.queue.clear()
+
+
+async def test_links_are_learned_from_acks_between_devices(
+    proto: MaxProtocol, stick: FakeStick
+) -> None:
+    proto.add_device(MaxDevice(WT, DeviceType.WALL_THERMOSTAT))
+    # The radiator thermostat acknowledges the wall thermostat's set point.
+    stick.emit(frame(MessageType.ACK, HT, WT, "0119002b"))
+    await settle()
+    assert proto.devices[HT].link_partners == {WT}
+
+
+async def test_zone_setup_gives_up_on_a_device_that_does_not_answer(
+    proto: MaxProtocol, stick: FakeStick, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(protocol_module, "ACK_TIMEOUT", 0.05)
+    proto.add_device(MaxDevice(WT, DeviceType.WALL_THERMOSTAT))
+    proto.add_device(MaxDevice(HT2, DeviceType.HEATING_THERMOSTAT))
+    stick.credits = 50000
+
+    def respond(command: str) -> list[str]:
+        sent = MaxMessage.from_line("Z" + command[2:])
+        if sent.dst == HT:  # out of range
+            return []
+        return [frame(MessageType.ACK, sent.dst, sent.src, "01", sent.counter)]
+
+    stick.on_send = respond
+    results = await proto.group_devices([HT, HT2, WT], 2)
+    assert isinstance(results[HT], NoAckError)
+    assert results[HT2] is None and results[WT] is None
+    to_ht = [m for m in sent_messages(stick) if m.dst == HT]
+    # Only the group id was tried (with its retries); its links were dropped.
+    assert {m.type for m in to_ht} == {MessageType.SET_GROUP_ID}
+
+
+async def test_repeated_zone_setup_does_not_duplicate_links(
+    proto: MaxProtocol, stick: FakeStick
+) -> None:
+    proto.add_device(MaxDevice(WT, DeviceType.WALL_THERMOSTAT))
+    stick.credits = 0
+    first = asyncio.create_task(proto.group_devices([HT, WT], 2))
+    await settle()
+    second = asyncio.create_task(proto.group_devices([HT, WT], 2))
+    await settle()
+    links = [m for m in proto.queue.pending if m.msg_type is MessageType.ADD_LINK_PARTNER]
+    assert len(links) == 2  # HT -> WT and WT -> HT, once each
+    proto.queue.clear()
+    await asyncio.gather(first, second, return_exceptions=True)

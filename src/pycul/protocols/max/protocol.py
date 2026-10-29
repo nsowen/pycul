@@ -121,6 +121,11 @@ type DeviceAddedListener = Callable[[MaxDevice], None]
 type MessageListener = Callable[[MaxMessage], None]
 
 
+def _link_key(address: str, partner: str) -> tuple[str, str, str]:
+    """Queue key of link frames: a newer add/remove for the same pair replaces an unsent one."""
+    return (normalize_address(address), "link", normalize_address(partner))
+
+
 def normalize_address(address: str) -> str:
     """Return a lower case 6 digit hex address or raise ValueError."""
     address = address.strip().lower()
@@ -537,6 +542,18 @@ class MaxProtocol(CulProtocol):
         partners (overheard, or sent to a whole group) show the group id and
         whom the device is linked with - FHEM ignores both.
         """
+        if message.type is MessageType.ACK:
+            # A device acknowledges frames of its link partners: the sender of
+            # this Ack has the receiver as partner (e.g. a radiator thermostat
+            # that never sends to its wall thermostat, only broadcasts).
+            if (
+                not message.is_broadcast
+                and message.dst not in self._own_addresses
+                and message.dst not in device.link_partners
+            ):
+                _LOGGER.info("Learned: %s is linked to %s (Ack)", device.address, message.dst)
+                device.link_partners.add(message.dst)
+            return
         if message.type not in _PEER_MESSAGES:
             return
         if message.flags & FLAGS_GROUP and message.group and device.group != message.group:
@@ -673,8 +690,18 @@ class MaxProtocol(CulProtocol):
         self._spawn(self._send_pair_pong(device))
 
     async def _send_pair_pong(self, device: MaxDevice) -> None:
+        # A device repeats its PairPing every few seconds until it gets an
+        # answer and only listens right after each ping: answer once, before
+        # anything else in the queue.
         try:
-            await self.send(device.address, MessageType.PAIR_PONG, b"\x00", group=0)
+            await self.send(
+                device.address,
+                MessageType.PAIR_PONG,
+                b"\x00",
+                group=0,
+                key=(device.address, MessageType.PAIR_PONG),
+                first=True,
+            )
             _LOGGER.info("Paired MAX! device %s", device.address)
             if device.device_type.is_thermostat:
                 await self.send_time_information(device.address)
@@ -791,6 +818,7 @@ class MaxProtocol(CulProtocol):
         key: Hashable | None = None,
         refresh: Callable[[], bytes] | None = None,
         expires: float | None = None,
+        first: bool = False,
     ) -> OutgoingMessage:
         """Queue a frame without waiting; await the returned entry's `future` for the Ack.
 
@@ -825,7 +853,7 @@ class MaxProtocol(CulProtocol):
             refresh=refresh,
             expires_at=time.monotonic() + expires if expires else None,
         )
-        queued = self.queue.submit(message)
+        queued = self.queue.submit(message, first=first)
         if (
             self.fast_send_after_wake_up
             and not hold
@@ -1096,7 +1124,14 @@ class MaxProtocol(CulProtocol):
                         device.address,
                         MessageType.ADD_LINK_PARTNER,
                         encode_link_partner(partner.address, partner.device_type),
+                        key=_link_key(device.address, partner.address),
                     )
+            # A device that does not answer its first frame would not answer the
+            # others either: they are skipped instead of spending air time.
+            queued = list(frames.values())
+            for other in queued[1:]:
+                if other.requires is None:
+                    other.requires = queued[0]
             results = await asyncio.gather(
                 *(f.future for f in frames.values()), return_exceptions=True
             )
@@ -1209,7 +1244,9 @@ class MaxProtocol(CulProtocol):
         """
         partner = normalize_address(partner)
         payload = encode_link_partner(partner, partner_type)
-        await self.send(address, MessageType.ADD_LINK_PARTNER, payload)
+        await self.send(
+            address, MessageType.ADD_LINK_PARTNER, payload, key=_link_key(address, partner)
+        )
         self._update_link_partners(address, partner, add=True)
 
     async def remove_link_partner(
@@ -1218,7 +1255,9 @@ class MaxProtocol(CulProtocol):
         """Remove a link created with add_link_partner (FHEM: set deassociate)."""
         partner = normalize_address(partner)
         payload = encode_link_partner(partner, partner_type)
-        await self.send(address, MessageType.REMOVE_LINK_PARTNER, payload)
+        await self.send(
+            address, MessageType.REMOVE_LINK_PARTNER, payload, key=_link_key(address, partner)
+        )
         self._update_link_partners(address, partner, add=False)
 
     def _update_link_partners(self, address: str, partner: str, *, add: bool) -> None:
