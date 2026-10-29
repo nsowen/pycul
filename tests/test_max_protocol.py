@@ -229,3 +229,18 @@ async def test_local_set_temperature_updates_device(
     await settle()
     assert max_proto.devices[HT].state.target_temperature == 23.0
     assert max_proto.devices[HT].state.mode is Mode.MANUAL
+
+
+@pytest.mark.parametrize(
+    ("version", "fake_wt"),
+    [("V 1.66_nocredits CUL868", True), ("V 1.67 CUL868", True), ("V 1.50 CUL868", False)],
+)
+async def test_fake_wt_depends_on_firmware(
+    cul: Cul, stick: FakeStick, version: str, fake_wt: bool
+) -> None:
+    stick.version = version
+    proto = MaxProtocol(ME, time_sync_interval=None)
+    cul.add_protocol(proto)
+    await cul.connect()
+    assert ("Zw111111" in stick.commands) is fake_wt
+    await cul.close()

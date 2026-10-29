@@ -238,3 +238,35 @@ async def test_two_wall_thermostats_in_one_group_are_logged(
     await proto.group_devices([HT, WT, "0f0f0f"], 6, link=False)
     assert "gets 2 wall thermostats" in caplog.text
     assert not [m for m in sent_messages(stick) if m.type is MessageType.ADD_LINK_PARTNER]
+
+
+async def test_paired_devices_heard_between_each_other_are_probed(
+    proto: MaxProtocol, stick: FakeStick
+) -> None:
+    # Our thermostats answer, the neighbour's wall thermostat does not.
+    neighbour = "0b0b0b"
+
+    def respond(command: str) -> list[str]:
+        sent = MaxMessage.from_line("Z" + command[2:])
+        if sent.dst == neighbour:
+            return []
+        return [frame(MessageType.ACK, sent.dst, sent.src, "01192028", sent.counter)]
+
+    stick.on_send = respond
+    stick.credits = 5000
+    # Wall thermostat -> radiator thermostat, nothing addressed to us.
+    stick.emit(frame(MessageType.WALL_THERMOSTAT_CONTROL, WT, HT2, "2AD2"))
+    stick.emit(frame(MessageType.WALL_THERMOSTAT_CONTROL, neighbour, "0c0c0c", "2AD2"))
+    for _ in range(60):
+        await asyncio.sleep(0.05)
+        if WT in proto.devices and HT2 in proto.devices:
+            break
+    assert proto.devices[WT].device_type is DeviceType.WALL_THERMOSTAT
+    assert proto.devices[HT2].device_type is DeviceType.HEATING_THERMOSTAT
+    # The Ack's state was applied right away.
+    assert proto.devices[HT2].state.target_temperature == 20.0
+    assert neighbour not in proto.devices
+    # Each of our devices is asked once.
+    probes = [m.dst for m in sent_messages(stick) if m.type is MessageType.TIME_INFORMATION]
+    assert probes.count(WT) == probes.count(HT2) == 1
+    assert neighbour in probes

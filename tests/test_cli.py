@@ -17,7 +17,7 @@ SC = "5c5c5c"
 
 
 def test_topology_from_overheard_frames(capsys: pytest.CaptureFixture[str]) -> None:
-    proto = MaxProtocol("123456", time_sync_interval=None)
+    proto = MaxProtocol("123456", time_sync_interval=None, probe_devices=False)
     _learn_topology(proto)
     for message in (
         MaxMessage(5, 0x04, MessageType.WALL_THERMOSTAT_CONTROL, WT, HT, 3, bytes.fromhex("2AD2")),

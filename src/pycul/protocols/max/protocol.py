@@ -68,6 +68,7 @@ if TYPE_CHECKING:
 _LOGGER = logging.getLogger(__name__)
 
 RE_ADDRESS = re.compile(r"^[0-9a-f]{6}$")
+RE_FIRMWARE_VERSION = re.compile(r"^(?P<major>\d+)\.(?P<minor>\d+)")
 #: Resend the time if a device's clock differs more than this (FHEM: broadcastTimeDiff).
 TIME_DIFF_TOLERANCE = 10
 #: Check every 5 minutes whether a thermostat needs a time update (one per check).
@@ -150,6 +151,7 @@ class MaxProtocol(CulProtocol):
         devices: Iterable[MaxDevice] = (),
         *,
         adopt_devices: bool = True,
+        probe_devices: bool = True,
         time_sync_interval: timedelta | None = timedelta(days=1),
         fake_wt_address: str | None = DEFAULT_FAKE_WT_ADDRESS,
         fake_sc_address: str | None = DEFAULT_FAKE_SC_ADDRESS,
@@ -159,6 +161,10 @@ class MaxProtocol(CulProtocol):
 
         adopt_devices: add unknown devices that send messages to our address
             (they are already paired with us, e.g. after migrating from FHEM).
+        probe_devices: with adopt_devices, also find paired devices that only
+            talk to each other: a device heard sending to another device gets
+            one time update; if it acknowledges, it is paired with us and is
+            adopted. Devices of other controllers do not answer.
         time_sync_interval: periodically send the time to known thermostats;
             None disables it (time requests of devices are still answered).
         fake_wt_address / fake_sc_address: addresses of the virtual wall
@@ -179,6 +185,9 @@ class MaxProtocol(CulProtocol):
         self._own_addresses = frozenset(own)
         self.devices: dict[str, MaxDevice] = {d.address: d for d in devices}
         self.adopt_devices = adopt_devices
+        self.probe_devices = probe_devices
+        #: Addresses asked whether they are paired with us (once per run).
+        self._probed: set[str] = set()
         self.time_sync_interval = time_sync_interval
         self.fast_send_after_wake_up = fast_send_after_wake_up
         self.queue = SendQueue(self._transmit, self._select_cul, self._is_awake)
@@ -212,11 +221,16 @@ class MaxProtocol(CulProtocol):
         version = cul.version
         if version is None or version.is_a_culfw:
             return True
-        try:
-            major, minor = (int(part) for part in version.version.split(".")[:2])
-        except ValueError:
+        # Builds carry suffixes, e.g. "1.66_nocredits" (compiled without duty cycle limit).
+        match = RE_FIRMWARE_VERSION.match(version.version)
+        if match is None:
+            _LOGGER.warning(
+                "%s: unknown culfw version %r, fake wall thermostat disabled",
+                cul.name,
+                version.version,
+            )
             return False
-        if (major, minor) < (1, 53):
+        if (int(match["major"]), int(match["minor"])) < (1, 53):
             _LOGGER.warning(
                 "%s: culfw %s is too old for the fake wall thermostat", cul.name, version.version
             )
@@ -385,6 +399,11 @@ class MaxProtocol(CulProtocol):
             if waiter and not waiter.done():
                 waiter.set_result(message.payload)
 
+        # A device that just transmitted listens for a moment: send what waits for it
+        # (shutter contacts cannot be woken up otherwise; FHEM: CUL_MAX_SQH).
+        self.queue.release(message.src)
+        self._probe_unknown_devices(message)
+
         device = self.devices.get(message.src)
         if device is None:
             device_type = TYPE_BY_MESSAGE.get(msg_type)
@@ -399,9 +418,6 @@ class MaxProtocol(CulProtocol):
         if message.rssi is not None:
             device.state.rssi = message.rssi
         self._learn_topology(device, message)
-        # A device that just transmitted listens for a moment: send what waits for it
-        # (shutter contacts cannot be woken up otherwise; FHEM: CUL_MAX_SQH).
-        self.queue.release(device.address)
 
         try:
             if msg_type is MessageType.ACK:
@@ -438,6 +454,58 @@ class MaxProtocol(CulProtocol):
                 device.notify()  # at least last_seen / rssi changed
         except PayloadError as err:
             _LOGGER.warning("Invalid %s from %s: %s", msg_type.name, message.src, err)
+
+    def _probe_unknown_devices(self, message: MaxMessage) -> None:
+        """Ask unknown devices heard talking to each other whether they are ours.
+
+        Devices paired with us only send to the controller now and then (time
+        requests, some state reports); with a wall thermostat, the radiator
+        thermostats talk almost only to it. FHEM knew them from its
+        configuration; we ask instead.
+        """
+        if not (self.adopt_devices and self.probe_devices) or message.dst in self._own_addresses:
+            return  # frames to us are handled by the regular adoption
+        candidates: list[tuple[str, DeviceType]] = []
+        if (device_type := TYPE_BY_MESSAGE.get(message.type)) is not None:
+            candidates.append((message.src, device_type))
+        if message.type is MessageType.WALL_THERMOSTAT_CONTROL and not message.is_broadcast:
+            # Wall thermostats send this to their radiator thermostats.
+            candidates.append((message.dst, DeviceType.HEATING_THERMOSTAT))
+        for address, device_type in candidates:
+            if address in self.devices or address in self._probed:
+                continue
+            self._probed.add(address)
+            # A window contact or eco switch only listens right after it sent.
+            listening_now = address == message.src and device_type in (
+                DeviceType.SHUTTER_CONTACT,
+                DeviceType.PUSH_BUTTON,
+            )
+            self._spawn(self._probe(address, device_type, listening_now))
+
+    async def _probe(self, address: str, device_type: DeviceType, listening_now: bool) -> None:
+        queued = self.enqueue(
+            address,
+            MessageType.TIME_INFORMATION,
+            encode_time_information(datetime.now()),
+            group=0,
+            flags=FLAGS_GROUP,
+            key=(address, MessageType.TIME_INFORMATION),
+            refresh=lambda: encode_time_information(datetime.now()),
+        )
+        if listening_now:
+            queued.hold_until_released = True
+            queued.released = True
+        try:
+            ack = await queued.future
+        except CulError as err:
+            _LOGGER.info("%s did not answer, not paired with %s: %s", address, self.address, err)
+            return
+        if address in self.devices or ack is None:
+            return
+        _LOGGER.info("Adopting MAX! device %s (%s): paired with us", address, device_type.name)
+        device = self.add_device(MaxDevice(address=address, device_type=device_type))
+        self._last_time_sync[address] = time.monotonic()
+        self._handle_ack(device, MaxMessage(0, 0, MessageType.ACK, address, self.address, 0, ack))
 
     def _learn_topology(self, device: MaxDevice, message: MaxMessage) -> None:
         """Learn groups and links from frames devices send to each other.

@@ -111,19 +111,23 @@ class ThermostatState:
 
     @classmethod
     def decode(cls, payload: bytes) -> ThermostatState:
-        """Decode a ThermostatState payload (3 bytes from Acks, 6 bytes otherwise)."""
+        """Decode a ThermostatState payload (3 bytes from Acks, 5 or 6 bytes otherwise).
+
+        Broadcast state reports can be 5 bytes long: enough for the measured
+        temperature, not for the end of a temporary mode (FHEM handles both).
+        """
         _require(payload, 3, "ThermostatState")
         status = StatusBits.decode(payload[0])
         current: float | None = None
         until: datetime | None = None
-        if len(payload) >= 6:
-            if status.mode is Mode.TEMPORARY:
+        if status.mode is Mode.TEMPORARY:
+            if len(payload) >= 6:
                 until = decode_until(payload[3], payload[4], payload[5])
-            else:
-                current = (((payload[3] & 0x01) << 8) | payload[4]) / 10
-                # The device sometimes reports 0.x degree - FHEM ignores values < 1.
-                if current < 1:
-                    current = None
+        elif len(payload) >= 5:
+            current = (((payload[3] & 0x01) << 8) | payload[4]) / 10
+            # The device sometimes reports 0.x degree - FHEM ignores values < 1.
+            if current < 1:
+                current = None
         return cls(
             status=status,
             valve_position=payload[1],

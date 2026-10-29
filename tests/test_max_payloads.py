@@ -189,3 +189,12 @@ def test_link_partner_payload() -> None:
 
     assert encode_link_partner("111111", DeviceType.WALL_THERMOSTAT).hex() == "11111103"
     assert encode_link_partner("222222", DeviceType.VIRTUAL_SHUTTER_CONTACT).hex() == "22222204"
+
+
+def test_thermostat_state_broadcast_with_five_bytes() -> None:
+    # Seen on air: 15f682 -> 000000, flags 04, payload 193f2c00d9
+    state = ThermostatState.decode(bytes.fromhex("193f2c00d9"))
+    assert state.status.mode is Mode.MANUAL
+    assert state.valve_position == 63
+    assert state.target_temperature == 22.0
+    assert state.current_temperature == pytest.approx(21.7)

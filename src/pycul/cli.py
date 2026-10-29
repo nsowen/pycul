@@ -296,6 +296,8 @@ async def _run(args: argparse.Namespace) -> int:
     max_proto = MaxProtocol(
         args.address,
         time_sync_interval=None,
+        # The CLI only sends what a command asks for (monitor/topology send nothing).
+        probe_devices=False,
         fake_wt_address=args.fake_wt,
         fake_sc_address=args.fake_sc,
     )
