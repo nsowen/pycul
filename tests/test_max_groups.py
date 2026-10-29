@@ -21,6 +21,7 @@ from pycul.protocols.max import (
     ShutterState,
     WeekProfile,
 )
+from pycul.protocols.max import protocol as protocol_module
 from pycul.protocols.max.payloads import encode_until
 from tests.conftest import FakeStick
 from tests.test_max_protocol import HT, ME, ack_responder, frame, sent_messages, settle
@@ -241,8 +242,9 @@ async def test_two_wall_thermostats_in_one_group_are_logged(
 
 
 async def test_paired_devices_heard_between_each_other_are_probed(
-    proto: MaxProtocol, stick: FakeStick
+    proto: MaxProtocol, stick: FakeStick, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    monkeypatch.setattr(protocol_module, "PROBE_DELAY", 0.01)
     # Our thermostats answer, the neighbour's wall thermostat does not.
     neighbour = "0b0b0b"
 
@@ -270,3 +272,30 @@ async def test_paired_devices_heard_between_each_other_are_probed(
     probes = [m.dst for m in sent_messages(stick) if m.type is MessageType.TIME_INFORMATION]
     assert probes.count(WT) == probes.count(HT2) == 1
     assert neighbour in probes
+
+
+async def test_probe_is_repeated_later_after_no_answer(
+    proto: MaxProtocol, stick: FakeStick, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(protocol_module, "PROBE_DELAY", 0.01)
+    monkeypatch.setattr(protocol_module, "ACK_TIMEOUT", 0.05)
+    stick.credits = 5000
+
+    def probes() -> int:
+        return sum(m.type is MessageType.TIME_INFORMATION for m in sent_messages(stick))
+
+    async def heard() -> None:
+        stick.emit(frame(MessageType.WALL_THERMOSTAT_STATE, WT, "000000", "19042b00d9"))
+        for _ in range(40):
+            await asyncio.sleep(0.02)
+
+    await heard()  # no answer (e.g. a collision): the first probe with its retries
+    first = probes()
+    assert first >= 1
+    await heard()  # heard again right away: not asked again yet
+    assert probes() == first
+    count, last = proto._probes[WT]
+    proto._probes[WT] = (count, last - protocol_module.PROBE_RETRY_AFTER - 1)
+    ack_responder(stick, state="192b00")
+    await heard()  # later: asked again, answers, adopted
+    assert WT in proto.devices

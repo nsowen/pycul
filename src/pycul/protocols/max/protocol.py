@@ -77,6 +77,12 @@ TIME_SYNC_CHECK_INTERVAL = 300.0
 DUPLICATE_WINDOW = 2.0
 #: Seconds a device stays awake after an acknowledged WakeUp (31 s minus margin, FHEM).
 WAKE_UP_DURATION = 26.0
+#: Wait after hearing a device before asking it whether it is ours: devices
+#: answer each other first, and a frame sent into that exchange collides.
+PROBE_DELAY = 3.0
+#: Ask a device that did not answer again after this long, at most PROBE_ATTEMPTS times.
+PROBE_RETRY_AFTER = 900.0
+PROBE_ATTEMPTS = 3
 #: Queue a WakeUp first when at least this many frames wait for one device.
 WAKE_UP_THRESHOLD = 3
 
@@ -186,8 +192,9 @@ class MaxProtocol(CulProtocol):
         self.devices: dict[str, MaxDevice] = {d.address: d for d in devices}
         self.adopt_devices = adopt_devices
         self.probe_devices = probe_devices
-        #: Addresses asked whether they are paired with us (once per run).
-        self._probed: set[str] = set()
+        #: Address -> (probes sent, time.monotonic() of the last one) for devices
+        #: asked whether they are paired with us.
+        self._probes: dict[str, tuple[int, float]] = {}
         self.time_sync_interval = time_sync_interval
         self.fast_send_after_wake_up = fast_send_after_wake_up
         self.queue = SendQueue(self._transmit, self._select_cul, self._is_awake)
@@ -471,10 +478,14 @@ class MaxProtocol(CulProtocol):
         if message.type is MessageType.WALL_THERMOSTAT_CONTROL and not message.is_broadcast:
             # Wall thermostats send this to their radiator thermostats.
             candidates.append((message.dst, DeviceType.HEATING_THERMOSTAT))
+        now = time.monotonic()
         for address, device_type in candidates:
-            if address in self.devices or address in self._probed:
+            if address in self.devices:
                 continue
-            self._probed.add(address)
+            count, last = self._probes.get(address, (0, 0.0))
+            if count >= PROBE_ATTEMPTS or (count and now - last < PROBE_RETRY_AFTER):
+                continue
+            self._probes[address] = (count + 1, now)
             # A window contact or eco switch only listens right after it sent.
             listening_now = address == message.src and device_type in (
                 DeviceType.SHUTTER_CONTACT,
@@ -483,6 +494,10 @@ class MaxProtocol(CulProtocol):
             self._spawn(self._probe(address, device_type, listening_now))
 
     async def _probe(self, address: str, device_type: DeviceType, listening_now: bool) -> None:
+        if not listening_now:
+            await asyncio.sleep(PROBE_DELAY)
+            if address in self.devices:
+                return  # adopted meanwhile
         queued = self.enqueue(
             address,
             MessageType.TIME_INFORMATION,
@@ -498,7 +513,15 @@ class MaxProtocol(CulProtocol):
         try:
             ack = await queued.future
         except CulError as err:
-            _LOGGER.info("%s did not answer, not paired with %s: %s", address, self.address, err)
+            count, _last = self._probes.get(address, (PROBE_ATTEMPTS, 0.0))
+            _LOGGER.info(
+                "%s did not answer (%d of %d): not paired with %s, or a collision: %s",
+                address,
+                count,
+                PROBE_ATTEMPTS,
+                self.address,
+                err,
+            )
             return
         if address in self.devices or ack is None:
             return
