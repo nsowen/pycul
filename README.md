@@ -80,9 +80,24 @@ for example `socket://192.168.1.10:2323` for a stick behind ser2net.
 MAX! devices only take commands from the controller they are paired with. The
 `address` you pass to `MaxProtocol` is the controller address of your CUL.
 
+**Pairing is not the same as peering.** Pairing binds a device to its
+controller; peering is the device-to-device links (see *Groups* below) — one
+can exist without the other. An **unpaired device still sends its state**
+(window contacts broadcast it), so it shows up in monitoring without ever
+being paired, while it silently ignores everything a controller sends to it:
+probes, configuration and link frames are all dropped. A device that is heard
+well but never answers a probe or a configuration write is usually not paired
+(FHEM shows `PairedTo 000000` for such devices). Pair it
+(`start_pairing()`, then the device's pair button) before trying to
+configure it.
+
 - **Migrating from FHEM:** use the address of your `CUL_MAX` device (FHEM's
   default is `123456`). Devices paired with FHEM then keep working without
   re-pairing. pycul adopts every device that sends messages to that address.
+  Devices FHEM only ever *displayed* are a different story: a window contact
+  needs no pairing to broadcast its state, which FHEM showed happily, so
+  contacts may never have been paired to FHEM at all. Pair them with
+  `start_pairing()`.
 - **Devices paired with a MAX! Cube:** factory-reset the device, then pair it
   with pycul (`start_pairing()` or `pycul pair`, then press the device's pair button).
 
@@ -160,6 +175,11 @@ Frames between other devices are decoded as well: a wall thermostat telling
 its radiator thermostats the room temperature updates the wall thermostat's
 state even though nothing was addressed to the controller.
 
+A radiator thermostat that is set at its own wheel waits about **60 seconds**
+before its valve motor moves (it debounces further input). The Ack already
+carries the new set point, but judge local changes by the valve position only
+after a minute.
+
 ### Groups (heating zones)
 
 A group id (FHEM: `groupid`, the Cube calls it room) ties a wall thermostat,
@@ -199,9 +219,10 @@ Shared window contacts are linked with the zone's thermostats but keep their
 group, so one contact can act on several zones; leave such contacts without
 group. Links that are already known are not sent again, so repeating the call
 after a partial failure only sends what is missing. The frames for a window
-contact are queued together and go out the next time it transmits (open or
-close the window). A zone of four devices needs about 16 frames, half the
-hourly duty cycle budget. Group 0 removes the devices from their group and
+contact are queued together and go out the next time it transmits — a window
+open or close, or its heartbeat, which can be hours away; open and close the
+window once to deliver them promptly. A zone of four devices needs about 16
+frames, half the hourly duty cycle budget. Group 0 removes the devices from their group and
 keeps the links. A zone with more than one wall thermostat is logged as a
 warning: each of them sends its set point to all thermostats it is linked
 with, so they overrule each other.
@@ -259,6 +280,17 @@ budget, so `set_week_profile()` only sends days that differ from the known
 profile and updates `week_profile` per day once all frames of that day are
 acknowledged. `target_at()` and `next_switch()` compute the scheduled
 temperature and the next change for display purposes.
+
+### Temperature and valve configuration
+
+The same is true for the temperature configuration (comfort, eco, min/max,
+offset, window-open temperature and duration) and the valve configuration
+(boost, decalcification, max valve, valve offset): **nothing can be read back
+over the air**. `configure_temperatures()` and `configure_valve()` write the
+whole block in one frame — values not included in the `TemperatureConfig` /
+`ValveConfig` are reset to their factory defaults on the device. Send the
+complete configuration every time, and track what was written (as
+`MaxDevice.week_profile` does for profiles) if the values are needed again.
 
 ### Several sticks
 
